@@ -1,0 +1,1633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pendulum</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;position:fixed;inset:0;cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ==== js/econ.js ==== */
+/* econ.js — pure tycoon economy (browser + node).
+   Tracks belong to 3 archetypes (calm / flare / surge) with different base
+   cost, cost growth and gain per level => real build choice. Value of a level
+   = ln(1+gain)/cost, so the best track rotates as levels rise.
+   Sim tests play this with zero player skill => pacing floor ~1h. */
+(function (root, factory) {
+  'use strict';
+  var api = factory();
+  if (typeof module === 'object' && module !== null && module.exports) module.exports = api;
+  if (root) root.Econ = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  var SCALE = 0.704;        // global cost multiplier (tuned: greedy run ~ 3600s)
+  var GROW_POW = 1;         // 1 = costs grow exactly with income (tight, no choice)
+                            // <1 = income outpaces costs -> player banks resonance
+                            //      and choices become unconstrained (real tradeoffs)
+  var HEAT_PER = 0.05;      // every surge level taxes ALL costs: risk/reward knob
+
+  // five one-time choices. each multiplies income by (1 + 0.015 * levels of
+  // that archetype at pick time) => value depends on the build you brought,
+  // so double-down vs diversify is a real decision, not a fixed "best pick".
+  var FOCUS_AT = [60, 120, 180, 240, 300];
+  var FOCUS_K = 0.015;
+  var BASE = 1;             // base resonance / second
+  var WIN_EACH = 0;         // (targets are per-archetype, see ARCH)
+  var WIN = 360;            // sum of all track targets (progress denominator)
+  var SWING_MAX = 0.30;     // income bonus from a vigorous swing
+  var SWING_AVG = 0.93;     // typical vigour without player input (sim assumption)
+  var OD_MULT = 2;          // overdrive multiplier
+
+  var ARCH = [
+    { id: 'calm',  c0: 12, r: 0.020, target: 40 }, // safe: +2%  /level
+    { id: 'flare', c0: 16, r: 0.060, target: 40 }, // mid:   +6%  /level
+    { id: 'surge', c0: 24, r: 0.160, target: 40 }  // spicy: +16% /level, self-punishing when stacked
+  ];
+
+  var TRACKS = [
+    { id: 'damp',  name: 'DAMP',  arch: 0, unlock: 0,   hint: 'damping falls' },
+    { id: 'mass',  name: 'MASS',  arch: 1, unlock: 0,   hint: 'bob grows' },
+    { id: 'harv',  name: 'HARV',  arch: 0, unlock: 0,   hint: 'harvest densifies' },
+    { id: 'push',  name: 'PUSH',  arch: 2, unlock: 24,  hint: 'kick strengthens' },
+    { id: 'chord', name: 'CHORD', arch: 1, unlock: 70,  hint: 'pendulum added' },
+    { id: 'aura',  name: 'AURA',  arch: 0, unlock: 120, hint: 'rings bloom' },
+    { id: 'fuse',  name: 'FUSE',  arch: 2, unlock: 170, hint: 'overdrive lasts' },
+    { id: 'phase', name: 'PHASE', arch: 1, unlock: 230, hint: 'charge quickens' },
+    { id: 'harm',  name: 'HARM',  arch: 2, unlock: 300, hint: 'harmonic gain' }
+  ];
+
+  for (var ti = 0; ti < TRACKS.length; ti++) {
+    TRACKS[ti].target = ARCH[TRACKS[ti].arch].target;
+  }
+
+  function create() {
+    var levels = [];
+    for (var i = 0; i < TRACKS.length; i++) levels.push(0);
+    return { money: 25, levels: levels, keystones: [] };
+  }
+
+  function total(s) {
+    var t = 0;
+    for (var i = 0; i < s.levels.length; i++) t += s.levels[i];
+    return t;
+  }
+
+  // progress toward harmony: overshoot does not count (targets differ per track)
+  function progress(s) {
+    var t = 0;
+    for (var i = 0; i < s.levels.length; i++) {
+      t += Math.min(TRACKS[i].target, s.levels[i]);
+    }
+    return t;
+  }
+
+  function unlocked(s, i) { return progress(s) >= TRACKS[i].unlock; }
+
+  function done(s, i) { return s.levels[i] >= TRACKS[i].target; }
+
+  function archOf(i) { return ARCH[TRACKS[i].arch]; }
+
+  /* Cost growth must equal income growth, otherwise the cost tail explodes and
+     the (policy-independent) endgame dominates runtime. Per full round of
+     purchases, income multiplies by the product below, so every active track's
+     cost must multiply by the same factor. Recomputed as tracks unlock/finish,
+     which keeps the identity true under any unlock or completion order. */
+  function growth(s) {
+    var g = 1;
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (unlocked(s, i) && !done(s, i)) g *= Math.pow(1 + archOf(i).r, GROW_POW);
+    }
+    return g;
+  }
+
+  // total surge levels = heat: stacking the spicy track taxes every cost
+  function heat(s) {
+    var surge = 0;
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (TRACKS[i].arch === 2) surge += s.levels[i];
+    }
+    return Math.pow(1 + HEAT_PER, surge);
+  }
+
+  function cost(s, i) {
+    var a = archOf(i);
+    return a.c0 * SCALE * Math.pow(growth(s), s.levels[i]) * heat(s);
+  }
+
+  // multiplicative gain of the next level on track i (e.g. 0.115 => 11.5%)
+  function gainPct(i) { return archOf(i).r; }
+
+  // gain per resonance spent — the number that drives every real decision
+  function value(s, i) { return Math.log(1 + archOf(i).r) / cost(s, i); }
+
+  function archLevels(s, arch) {
+    var n = 0;
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (TRACKS[i].arch === arch) n += s.levels[i];
+    }
+    return n;
+  }
+
+  function focusMult(s, arch) { return 1 + FOCUS_K * archLevels(s, arch); }
+
+  // index of the next waiting keystone, or -1
+  function pending(s) {
+    var p = progress(s), need = 0;
+    for (var i = 0; i < FOCUS_AT.length; i++) if (p >= FOCUS_AT[i]) need++;
+    return s.keystones.length < need ? s.keystones.length : -1;
+  }
+
+  function choose(s, arch) { s.keystones.push(focusMult(s, arch)); }
+
+  function keystoneMult(s) {
+    var m = 1;
+    for (var i = 0; i < s.keystones.length; i++) m *= s.keystones[i];
+    return m;
+  }
+
+  function income(s) {
+    var v = BASE * keystoneMult(s);
+    for (var i = 0; i < TRACKS.length; i++) {
+      v *= Math.pow(1 + archOf(i).r, s.levels[i]);
+    }
+    return v;
+  }
+
+  function odDuration(s) { return 3.5 + 0.12 * s.levels[6]; }
+  function odRate(s)     { return 0.015 + 0.0009 * s.levels[7]; }
+  function odUptime(s)   { var d = odDuration(s) * odRate(s); return d / (1 + d); }
+
+  function liveRate(s, swing01, odOn) {
+    return income(s) * (1 + SWING_MAX * swing01) * (odOn ? OD_MULT : 1);
+  }
+
+  // no-skill assumption: swing ~0.93, modelled overdrive uptime
+  function avgRate(s) {
+    return income(s) * (1 + SWING_MAX * SWING_AVG) * (1 + odUptime(s));
+  }
+
+  function canBuy(s, i) { return unlocked(s, i) && s.money >= cost(s, i); }
+
+  function buy(s, i) {
+    if (!canBuy(s, i)) return false;
+    s.money -= cost(s, i);
+    s.levels[i]++;
+    return true;
+  }
+
+  // best affordable upgrade: highest gain per resonance spent
+  function bestBuy(s) {
+    var best = -1, bv = 0;
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (!canBuy(s, i) || done(s, i)) continue;
+      var v = value(s, i);
+      if (v > bv) { bv = v; best = i; }
+    }
+    return best;
+  }
+
+  // deliberately poor play: lowest gain per resonance (for tests / trap tracks)
+  function worstBuy(s) {
+    var best = -1, bv = Infinity;
+    for (var i = 0; i < TRACKS.length; i++) {
+      if (!canBuy(s, i) || done(s, i)) continue;
+      var v = value(s, i);
+      if (v < bv) { bv = v; best = i; }
+    }
+    return best;
+  }
+
+  function isWin(s) { return progress(s) >= WIN; }
+
+  var UNITS = ['', 'k', 'M', 'B', 'T', 'Qa', 'Qi'];
+
+  function fmt(n) {
+    if (!isFinite(n)) return 'inf';
+    if (n < 0) return '-' + fmt(-n);
+    if (n < 1000) return n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : Math.round(n).toString();
+    for (var i = UNITS.length - 1; i >= 0; i--) {
+      var p = Math.pow(1000, i);
+      if (n >= p) {
+        var v = n / p;
+        return (v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : Math.floor(v)) + UNITS[i];
+      }
+    }
+    return String(n);
+  }
+
+  function mmss(sec) {
+    var s = Math.max(0, Math.floor(sec));
+    var m = Math.floor(s / 60);
+    var r = s % 60;
+    return m + ':' + (r < 10 ? '0' : '') + r;
+  }
+
+  return {
+    SCALE: SCALE, setScale: function (v) { SCALE = v; },
+    GROW_POW: GROW_POW, setGrowPow: function (v) { GROW_POW = v; },
+    HEAT_PER: HEAT_PER, setHeat: function (v) { HEAT_PER = v; },
+    BASE: BASE, WIN: WIN, OD_MULT: OD_MULT,
+    SWING_MAX: SWING_MAX, SWING_AVG: SWING_AVG,
+    ARCH: ARCH, TRACKS: TRACKS, growth: growth, heat: heat, targetOf: function (i) { return TRACKS[i].target; },
+    FOCUS_AT: FOCUS_AT, FOCUS_K: FOCUS_K,
+    pending: pending, choose: choose, focusMult: focusMult, archLevels: archLevels, keystoneMult: keystoneMult,
+    create: create, total: total, progress: progress, unlocked: unlocked, done: done,
+    cost: cost, gainPct: gainPct, value: value, income: income,
+    odDuration: odDuration, odRate: odRate, odUptime: odUptime,
+    liveRate: liveRate, avgRate: avgRate,
+    canBuy: canBuy, buy: buy, bestBuy: bestBuy, worstBuy: worstBuy,
+    isWin: isWin, fmt: fmt, mmss: mmss
+  };
+});
+
+</script>
+<script>
+/* ==== js/pendulum.js ==== */
+/* pendulum.js — double pendulum physics (RK4). Browser (global Phys) + node. */
+(function (root, factory) {
+  'use strict';
+  var api = factory();
+  if (typeof module === 'object' && module !== null && module.exports) module.exports = api;
+  if (root) root.Phys = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  var G = 9.81;
+  var d = new Float64Array(4);
+  var k1 = new Float64Array(4), k2 = new Float64Array(4);
+  var k3 = new Float64Array(4), k4 = new Float64Array(4);
+  var tmp = new Float64Array(4);
+
+  function derivs(s, cfg, out) {
+    var t1 = s[0], w1 = s[1], t2 = s[2], w2 = s[3];
+    var m1 = cfg.m1, m2 = cfg.m2;
+    var del = t1 - t2;
+    var sd = Math.sin(del), cd = Math.cos(del);
+    var den = 2 * m1 + m2 - m2 * Math.cos(2 * del);
+    if (Math.abs(den) < 1e-9) den = 1e-9;
+
+    var a1 = (-G * (2 * m1 + m2) * Math.sin(t1)
+              - m2 * G * Math.sin(t1 - 2 * t2)
+              - 2 * sd * m2 * (w2 * w2 + w1 * w1 * cd)) / den
+             - cfg.b * w1;
+
+    var a2 = (2 * sd * (w1 * w1 * (m1 + m2) + G * (m1 + m2) * Math.cos(t1) + w2 * w2 * m2 * cd)) / den
+             - cfg.b * w2;
+
+    out[0] = w1; out[1] = a1; out[2] = w2; out[3] = a2;
+  }
+
+  function rk4(s, dt, cfg) {
+    derivs(s, cfg, k1);
+    for (var i = 0; i < 4; i++) tmp[i] = s[i] + k1[i] * dt * 0.5;
+    derivs(tmp, cfg, k2);
+    for (i = 0; i < 4; i++) tmp[i] = s[i] + k2[i] * dt * 0.5;
+    derivs(tmp, cfg, k3);
+    for (i = 0; i < 4; i++) tmp[i] = s[i] + k3[i] * dt;
+    derivs(tmp, cfg, k4);
+    for (i = 0; i < 4; i++) s[i] += (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+  }
+
+  // Relative energy: 0 = hanging at rest, = max when fully inverted.
+  function energyRel(st, cfg) {
+    var t1 = st[0], w1 = st[1], t2 = st[2], w2 = st[3];
+    var y1 = -Math.cos(t1), y2 = y1 - Math.cos(t2);
+    var v1sq = w1 * w1;
+    var v2sq = w1 * w1 + w2 * w2 + 2 * w1 * w2 * Math.cos(t1 - t2);
+    var ke = 0.5 * cfg.m1 * v1sq + 0.5 * cfg.m2 * v2sq;
+    var pe = G * (cfg.m1 * y1 + cfg.m2 * y2);
+    var peMin = -G * (cfg.m1 + 2 * cfg.m2);
+    var e = ke + (pe - peMin);
+    return isFinite(e) ? e : 0;
+  }
+
+  function make(seedAngle) {
+    var a = seedAngle || 0;
+    return new Float64Array([0.35 + a, 0, -0.2 + a * 0.5, 0]);
+  }
+
+  // Advance one pendulum. cfg: {m1, m2, b, push, target, hold}
+  function step(st, dt, cfg, hold) {
+    if (hold) return;
+    rk4(st, dt, cfg);
+    var e = energyRel(st, cfg);
+    var def = (cfg.target - e) / cfg.target;
+    if (def > 0) {
+      var dir = st[1] >= 0 ? 1 : -1;
+      var k = cfg.push * def;
+      st[1] += dir * k * 3 * dt;
+      st[3] += dir * k * 2 * dt;
+    } else if (e > cfg.target * 1.7) {
+      st[1] *= 0.994; st[3] *= 0.994;
+    }
+    if (!isFinite(st[0] + st[1] + st[2] + st[3])) {
+      st[0] = 0.35; st[1] = 0; st[2] = -0.2; st[3] = 0;
+    }
+  }
+
+  function vigour(st, cfg) {
+    var e = energyRel(st, cfg);
+    var v = e / cfg.target;
+    return v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+
+  return { G: G, make: make, step: step, energyRel: energyRel, vigour: vigour };
+});
+
+</script>
+<script>
+/* ==== js/audio.js ==== */
+/* audio.js — zero-asset WebAudio. Everything synthesized, no files. */
+var Sfx = (function () {
+  'use strict';
+
+  var ctx = null, master = null, muted = false, lastStrike = 0;
+
+  function ensure() {
+    try {
+      if (!ctx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        ctx = new AC();
+        master = ctx.createGain();
+        master.gain.value = muted ? 0 : 0.3;
+        master.connect(ctx.destination);
+      }
+      if (ctx.state === 'suspended') ctx.resume();
+      return ctx;
+    } catch (e) { return null; }
+  }
+
+  function tone(type, f0, f1, dur, gain, delay) {
+    var c = ensure();
+    if (!c || muted) return;
+    var t0 = c.currentTime + (delay || 0);
+    var osc = c.createOscillator();
+    var g = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t0);
+    if (f1 && f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g); g.connect(master);
+    osc.start(t0); osc.stop(t0 + dur + 0.05);
+  }
+
+  return {
+    unlock: function () { ensure(); },
+
+    // bob strikes the bottom: pitch follows speed
+    strike: function (speed) {
+      var now = performance.now();
+      if (now - lastStrike < 90) return;
+      lastStrike = now;
+      var f = Math.min(760, 150 + speed * 0.9);
+      tone('sine', f, f * 0.72, 0.16, Math.min(0.16, 0.03 + speed * 0.0004));
+    },
+
+    buy: function () {
+      tone('square', 660, 990, 0.07, 0.06);
+      tone('square', 990, 1320, 0.06, 0.04, 0.05);
+    },
+
+    pulse: function () { tone('sine', 320, 190, 0.12, 0.05); },
+
+    // perfect-timing resonance hit
+    sync: function () {
+      tone('triangle', 880, 1760, 0.2, 0.11);
+      tone('triangle', 1320, 2640, 0.18, 0.06, 0.03);
+    },
+
+    od: function () { tone('sawtooth', 55, 165, 1.1, 0.09); },
+
+    focus: function () { tone('sine', 440, 880, 0.3, 0.08); },
+
+    phase: function () { tone('sine', 220, 880, 0.5, 0.05); },
+
+    win: function () {
+      [523.25, 659.25, 783.99, 1046.5].forEach(function (f, i) {
+        tone('triangle', f, f, 1.5, 0.07, i * 0.14);
+      });
+    },
+
+    toggle: function () {
+      muted = !muted;
+      if (master) master.gain.value = muted ? 0 : 0.3;
+      return muted;
+    },
+    isMuted: function () { return muted; }
+  };
+})();
+
+</script>
+<script>
+/* ==== js/render.js ==== */
+/* render.js — maximalist scene, minimalist chrome. All UI drawn on canvas. */
+var Render = (function () {
+  'use strict';
+
+  var W = 0, H = 0;
+  var phase = -1;
+  var h0 = 205, h1 = 345;
+  var stars = [], parts = [], rings = [], floats = [], hist = [];
+  var grainPattern = null, vignette = null;
+  var shake = 0, flash = 0, tGlobal = 0;
+  var MAX_PARTS = 900, MAX_HIST = 480;
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  function buildGrain() {
+    var n = document.createElement('canvas');
+    n.width = n.height = 128;
+    var g = n.getContext('2d');
+    var img = g.createImageData(128, 128);
+    for (var i = 0; i < img.data.length; i += 4) {
+      var v = (Math.random() * 255) | 0;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+      img.data[i + 3] = 26;
+    }
+    g.putImageData(img, 0, 0);
+    grainPattern = g.createPattern(n, 'repeat');
+  }
+
+  function buildStars() {
+    stars = [];
+    for (var i = 0; i < 210; i++) {
+      stars.push({
+        x: Math.random(), y: Math.random(),
+        z: rand(0.25, 1), s: rand(0.5, 1.7),
+        seed: rand(0, Math.PI * 2)
+      });
+    }
+  }
+
+  function resize(w, h, dpr) {
+    W = w; H = h;
+    var c = document.getElementById('c');
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+    c.style.width = w + 'px';
+    c.style.height = h + 'px';
+    vignette = ctx.createRadialGradient(w / 2, h * 0.45, Math.min(w, h) * 0.25, w / 2, h * 0.5, Math.max(w, h) * 0.78);
+    vignette.addColorStop(0, 'rgba(0,0,0,0)');
+    vignette.addColorStop(0.62, 'rgba(0,0,0,0.18)');
+    vignette.addColorStop(1, 'rgba(0,0,0,0.72)');
+    if (!grainPattern) buildGrain();
+    if (!stars.length) buildStars();
+    if (phase < 0) setPhase(0);
+  }
+
+  function setPhase(p) {
+    phase = p;
+    h0 = (205 + p * 27) % 360;
+    h1 = (h0 + 140) % 360;
+    flash = Math.max(flash, 0.9);
+  }
+
+  function spark(x, y, hue, n, spd) {
+    for (var i = 0; i < n && parts.length < MAX_PARTS; i++) {
+      var a = rand(0, Math.PI * 2), v = rand(0.3, 1) * spd;
+      parts.push({
+        x: x, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - spd * 0.25,
+        life: 1, decay: rand(0.5, 1.2), hue: hue + rand(-24, 24), s: rand(1, 2.8)
+      });
+    }
+  }
+
+  function ring(x, y, hue, big) {
+    rings.push({ x: x, y: y, r: 4, rMax: big ? 260 : 90, life: 1, hue: hue, w: big ? 3 : 1.6 });
+    if (rings.length > 40) rings.shift();
+  }
+
+  function float(x, y, txt, hue) {
+    floats.push({ x: x, y: y, txt: txt, life: 1, hue: hue });
+    if (floats.length > 24) floats.shift();
+  }
+
+  function boom(v) { shake = Math.min(26, shake + v); }
+  function pop() { flash = Math.min(1, flash + 0.55); }
+
+  function update(dt, view) {
+    tGlobal += dt;
+    shake *= Math.pow(0.001, dt);
+    flash *= Math.pow(0.02, dt);
+    if (shake < 0.05) shake = 0;
+
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      p.life -= p.decay * dt;
+      if (p.life <= 0) { parts.splice(i, 1); continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= Math.pow(0.35, dt); p.vy *= Math.pow(0.35, dt);
+      p.vy += 26 * dt;
+    }
+    for (i = rings.length - 1; i >= 0; i--) {
+      var r = rings[i];
+      r.life -= dt * 0.9;
+      r.r += (r.rMax - r.r) * Math.min(1, dt * 4.2);
+      if (r.life <= 0) rings.splice(i, 1);
+    }
+    for (i = floats.length - 1; i >= 0; i--) {
+      var f = floats[i];
+      f.life -= dt * 0.62;
+      f.y -= dt * 26;
+      if (f.life <= 0) floats.splice(i, 1);
+    }
+
+    hist.push(view.energy01);
+    if (hist.length > MAX_HIST) hist.shift();
+
+    // harvest motes
+    var rate = (0.6 + view.harv * 0.16) * view.pends.length;
+    for (i = 0; i < view.pends.length; i++) {
+      var pd = view.pends[i];
+      var emit = Math.min(6, rate * dt / Math.max(1, view.pends.length));
+      if (Math.random() < emit * (1 + view.harv * 0.05)) {
+        spark(pd.x2, pd.y2, (Math.random() < 0.5 ? h0 : h1) + rand(-30, 30), 1, 70);
+      }
+    }
+  }
+
+  function drawSpaced(g, txt, x, y, sp) {
+    var prev = g.textAlign;
+    g.textAlign = 'left';
+    var total = 0, i;
+    for (i = 0; i < txt.length; i++) total += g.measureText(txt[i]).width + sp;
+    total -= sp;
+    var cx = x - total / 2;
+    for (i = 0; i < txt.length; i++) {
+      g.fillText(txt[i], cx, y);
+      cx += g.measureText(txt[i]).width + sp;
+    }
+    g.textAlign = prev;
+  }
+
+  function drawBackground(view) {
+    var t = tGlobal;
+    var grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, 'hsl(' + h0 + ',52%,' + (4 + view.energy01 * 3) + '%)');
+    grad.addColorStop(0.55, 'hsl(' + ((h0 + 24) % 360) + ',48%,' + (7 + view.odOn * 4) + '%)');
+    grad.addColorStop(1, 'hsl(' + h1 + ',44%,3%)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // nebula blooms
+    ctx.globalCompositeOperation = 'lighter';
+    var blobs = Math.min(5, 3 + Math.floor(view.aura / 16));
+    for (var i = 0; i < blobs; i++) {
+      var ph = i * 1.7;
+      var bx = W * (0.5 + 0.42 * Math.sin(t * 0.07 + ph) * Math.cos(t * 0.031 + ph * 2));
+      var by = H * (0.45 + 0.35 * Math.cos(t * 0.05 + ph * 1.3));
+      var rr = Math.min(W, H) * (0.17 + 0.08 * Math.sin(t * 0.09 + ph));
+      var gg = ctx.createRadialGradient(bx, by, 0, bx, by, rr);
+      var hue = i % 2 ? h1 : h0;
+      gg.addColorStop(0, 'hsla(' + hue + ',90%,55%,' + (0.05 + 0.03 * view.energy01) + ')');
+      gg.addColorStop(1, 'hsla(' + hue + ',90%,50%,0)');
+      ctx.fillStyle = gg;
+      ctx.fillRect(bx - rr, by - rr, rr * 2, rr * 2);
+    }
+
+    // stars
+    for (i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      var tw = 0.35 + 0.65 * Math.abs(Math.sin(t * (0.4 + s.z) + s.seed));
+      var sx = ((s.x + t * 0.004 * s.z) % 1) * W;
+      var sy = ((s.y + t * 0.0016 * s.z) % 1) * H;
+      ctx.fillStyle = 'hsla(' + ((i * 7) % 360) + ',60%,85%,' + (0.5 * tw * s.z) + ')';
+      ctx.fillRect(sx, sy, s.s, s.s);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function drawMandala(view) {
+    var cx = W / 2, cy = H * 0.42;
+    var base = Math.min(W, H) * 0.5;
+    var t = tGlobal;
+    var ringsN = 4 + Math.floor(view.energy01 * 5 + view.aura / 6);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1;
+    for (var i = 0; i < ringsN; i++) {
+      var rr = base * (0.34 + i * 0.13) + Math.sin(t * 0.6 + i) * 6;
+      if (rr > Math.max(W, H) * 0.78) break;
+      var spin = (i % 2 ? 1 : -1) * (0.05 + i * 0.018) * (1 + view.energy01 * 1.6 + (view.odOn ? 1.4 : 0));
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(t * spin + view.headAngle * (i % 2 ? 0.3 : -0.2));
+      var segs = 6 + i * 3;
+      var hue = (h0 + i * 16) % 360;
+      ctx.strokeStyle = 'hsla(' + hue + ',85%,62%,' + (0.05 + 0.05 * view.energy01) + ')';
+      ctx.beginPath();
+      for (var k = 0; k < segs; k++) {
+        var a0 = (k / segs) * Math.PI * 2;
+        var a1 = a0 + (Math.PI * 2 / segs) * 0.55;
+        ctx.moveTo(Math.cos(a0) * rr, Math.sin(a0) * rr);
+        ctx.arc(0, 0, rr, a0, a1);
+      }
+      ctx.stroke();
+      if (i % 3 === 0) {
+        ctx.strokeStyle = 'hsla(' + h1 + ',90%,70%,0.09)';
+        ctx.beginPath();
+        ctx.arc(0, 0, rr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function drawGrid() {
+    ctx.save();
+    ctx.strokeStyle = 'hsla(' + h1 + ',80%,60%,0.055)';
+    ctx.lineWidth = 1;
+    var y0 = H * 0.7;
+    for (var i = 0; i < 10; i++) {
+      var f = i / 10;
+      var y = y0 + (H - y0) * f * f;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    var vp = H * 0.62;
+    for (i = -8; i <= 8; i++) {
+      ctx.beginPath();
+      ctx.moveTo(W / 2 + i * (W / 8) * 0.16, H);
+      ctx.lineTo(W / 2 + i * 24, vp);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawScope() {
+    if (hist.length < 2) return;
+    var y = H - 130, amp = 15;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = 'hsla(' + h1 + ',90%,66%,0.34)';
+    ctx.beginPath();
+    for (var i = 0; i < hist.length; i++) {
+      var x = (i / (MAX_HIST - 1)) * W;
+      var yy = y - hist[i] * amp;
+      if (i === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawTrails(view) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var CHUNKS = 8;
+    for (var p = 0; p < view.pends.length; p++) {
+      var tr = view.pends[p].trail;
+      if (tr.length < 6) continue;
+      var per = Math.ceil(tr.length / CHUNKS);
+      for (var c = 0; c < CHUNKS; c++) {
+        var a = c * per;
+        var b = Math.min(tr.length - 1, a + per);
+        if (b - a < 1) continue;
+        var f = (c + 1) / CHUNKS;
+        ctx.strokeStyle = 'hsla(' + ((h0 + c * 20 + tGlobal * 40) % 360) + ',95%,' + (52 + f * 20) + '%,' + (f * f * 0.30) + ')';
+        ctx.lineWidth = 0.7 + f * 3.2;
+        ctx.beginPath();
+        ctx.moveTo(tr[a][0], tr[a][1]);
+        for (var i = a + 1; i <= b; i++) ctx.lineTo(tr[i][0], tr[i][1]);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawPendulums(view) {
+    for (var p = 0; p < view.pends.length; p++) {
+      var pd = view.pends[p];
+      var hue = (h0 + p * 24) % 360;
+      // rods: cheap layered glow (no shadowBlur — it tanks fill-rate)
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = 'hsla(' + hue + ',95%,60%,0.16)';
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      ctx.moveTo(pd.px, pd.py);
+      ctx.lineTo(pd.x1, pd.y1);
+      ctx.lineTo(pd.x2, pd.y2);
+      ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+      var gr = ctx.createLinearGradient(pd.px, pd.py, pd.x2, pd.y2);
+      gr.addColorStop(0, 'hsla(0,0%,100%,0.9)');
+      gr.addColorStop(0.5, 'hsla(' + hue + ',95%,70%,0.85)');
+      gr.addColorStop(1, 'hsla(' + h1 + ',95%,70%,0.9)');
+      ctx.strokeStyle = gr;
+      ctx.lineWidth = 2.6;
+      ctx.beginPath();
+      ctx.moveTo(pd.px, pd.py);
+      ctx.lineTo(pd.x1, pd.y1);
+      ctx.lineTo(pd.x2, pd.y2);
+      ctx.stroke();
+      ctx.restore();
+
+      // joints
+      joint(pd.px, pd.py, 3.2, hue);
+      joint(pd.x1, pd.y1, pd.r * 0.42, hue);
+      bob(pd.x2, pd.y2, pd.r, hue, p);
+
+      // resonance window: the bob is a live target for ~0.22s
+      var sync = view.syncs ? view.syncs[p] : 0;
+      if (sync > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        var sr = pd.r * (2.1 + (1 - sync) * 1.3);
+        ctx.strokeStyle = 'rgba(255,255,255,' + (0.3 + 0.6 * sync) + ')';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(pd.x2, pd.y2, sr, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.45 + 0.5 * sync) + ')';
+        ctx.beginPath();
+        ctx.moveTo(pd.x2 - 6, pd.y2 - sr - 9);
+        ctx.lineTo(pd.x2 + 6, pd.y2 - sr - 9);
+        ctx.lineTo(pd.x2, pd.y2 - sr - 3);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  function joint(x, y, r, hue) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    var g = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
+    g.addColorStop(0, 'rgba(255,255,255,0.95)');
+    g.addColorStop(0.4, 'hsla(' + hue + ',95%,70%,0.7)');
+    g.addColorStop(1, 'hsla(' + hue + ',95%,60%,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r * 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function bob(x, y, r, hue, idx) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    var g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.1, x, y, r * 1.6);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.35, 'hsla(' + hue + ',100%,72%,0.95)');
+    g.addColorStop(0.75, 'hsla(' + hue + ',100%,52%,0.55)');
+    g.addColorStop(1, 'hsla(' + hue + ',100%,50%,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r * 1.6, 0, Math.PI * 2); ctx.fill();
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = 'hsla(' + hue + ',100%,86%,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+
+    // orbiting ticks
+    ctx.globalCompositeOperation = 'lighter';
+    var t = tGlobal * (1.4 + idx * 0.2);
+    for (var i = 0; i < 6; i++) {
+      var a = t + (i / 6) * Math.PI * 2;
+      var rr = r * 1.25;
+      ctx.fillStyle = 'hsla(' + h1 + ',100%,75%,0.7)';
+      ctx.fillRect(x + Math.cos(a) * rr - 0.9, y + Math.sin(a) * rr - 0.9, 1.8, 1.8);
+    }
+    ctx.restore();
+  }
+
+  function drawParts() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      ctx.fillStyle = 'hsla(' + p.hue + ',95%,66%,' + (p.life * 0.85) + ')';
+      ctx.fillRect(p.x, p.y, p.s, p.s);
+    }
+    for (i = 0; i < rings.length; i++) {
+      var r = rings[i];
+      ctx.strokeStyle = 'hsla(' + r.hue + ',95%,68%,' + (r.life * 0.75) + ')';
+      ctx.lineWidth = r.w * r.life;
+      ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = '600 12px ui-monospace, Menlo, Consolas, monospace';
+    for (i = 0; i < floats.length; i++) {
+      var f = floats[i];
+      ctx.fillStyle = 'hsla(' + f.hue + ',95%,76%,' + Math.max(0, f.life) + ')';
+      ctx.fillText(f.txt, f.x, f.y);
+    }
+    ctx.restore();
+  }
+
+  function drawOverdrive(view) {
+    if (!view.odOn && flash < 0.02) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    if (view.odOn) {
+      var t = tGlobal;
+      for (var i = 0; i < 4; i++) {
+        var rr = ((t * 0.42 + i * 0.25) % 1) * Math.max(W, H) * 0.75;
+        ctx.strokeStyle = 'hsla(' + ((h0 + i * 45 + t * 60) % 360) + ',95%,62%,0.14)';
+        ctx.lineWidth = 2 + i;
+        ctx.beginPath(); ctx.arc(W / 2, H * 0.42, rr, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.fillStyle = 'hsla(' + ((h0 + t * 40) % 360) + ',90%,55%,0.055)';
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (flash > 0.02) {
+      ctx.fillStyle = 'rgba(255,255,255,' + (flash * 0.30) + ')';
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.restore();
+  }
+
+  // ---- minimal chrome -------------------------------------------------
+
+  function mono(size, weight) {
+    return (weight || 400) + ' ' + size + 'px ui-monospace, Menlo, Consolas, monospace';
+  }
+
+  function drawHUD(view) {
+    var ui = view.ui;
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+
+    ctx.font = mono(12);
+    ctx.fillStyle = 'rgba(255,255,255,0.62)';
+    ctx.fillText(Econ.fmt(ui.money) + ' \u223f', 16, 24);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.34)';
+    ctx.fillText('\u00d7' + Econ.fmt(ui.mult), 16 + ctx.measureText(Econ.fmt(ui.money) + ' \u223f').width + 16, 24);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(255,255,255,0.34)';
+    ctx.fillText(ui.clock, W - 16, 24);
+
+    ctx.font = mono(10);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,255,255,0.26)';
+    ctx.fillText(Econ.fmt(ui.rate) + '/s', 16, 40);
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillText(ui.progress + '/' + Econ.WIN, 16 + ctx.measureText(Econ.fmt(ui.rate) + '/s').width + 12, 40);
+
+    // overdrive charge: one 18px hairline, nothing more
+    if (ui.charge > 0.001 && !ui.win) {
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      ctx.fillRect(16, 47, 60, 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.fillRect(16, 47, 60 * ui.charge, 2);
+    }
+    ctx.restore();
+  }
+
+  // five one-time archetype choices: 3 zones, one line
+  function drawFocus(view) {
+    var f = view.ui.focus;
+    if (!f) return;
+    var names = ['calm', 'flare', 'surge'];
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = mono(10);
+    ctx.fillStyle = 'rgba(255,255,255,0.32)';
+    ctx.fillText('focus \u2014 ' + (f.index + 1) + '/5', W / 2, f.zones[0].y - 16);
+    for (var a = 0; a < f.zones.length; a++) {
+      var z = f.zones[a];
+      var hov = f.hover === a;
+      ctx.font = mono(12);
+      ctx.fillStyle = hov ? 'rgba(255,255,255,0.92)' : 'rgba(255,255,255,0.5)';
+      ctx.fillText(names[a] + ' \u00d7' + z.mult.toFixed(2), z.x + z.w / 2, z.y + 15);
+      ctx.fillStyle = hov ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.18)';
+      ctx.fillRect(z.x + 10, z.y + 24, z.w - 20, hov ? 2 : 1);
+    }
+    ctx.restore();
+  }
+
+  function drawStrip(view) {
+    var ui = view.ui;
+    var rects = ui.rects;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = mono(10);
+
+    for (var i = 0; i < rects.length; i++) {
+      var r = rects[i];
+      var lvl = ui.levels[i];
+      var unlocked = ui.unlocked[i];
+      var afford = ui.afford[i];
+      var cx = r.x + r.w / 2;
+      var baseY = r.y + r.h - 14;
+      var maxH = 30;
+      var h = Math.min(1, lvl / 40) * maxH;
+
+      if (!unlocked) {
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.fillRect(cx - 1, baseY - 4, 2, 4);
+      } else {
+        var hue = afford ? (h0 + i * 27) % 360 : 0;
+        ctx.fillStyle = afford
+          ? 'hsla(' + hue + ',95%,66%,0.92)'
+          : 'rgba(255,255,255,0.30)';
+        ctx.fillRect(cx - 1.5, baseY - h, 3, h);
+        if (afford) {
+          ctx.beginPath();
+          ctx.moveTo(cx - 3.5, baseY - h - 8);
+          ctx.lineTo(cx + 3.5, baseY - h - 8);
+          ctx.lineTo(cx, baseY - h - 3.5);
+          ctx.closePath();
+          ctx.fill();
+        }
+        if (ui.hover === i) {
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.fillRect(cx - 1.5, baseY - h, 3, h);
+        }
+      }
+
+      // baseline hairline
+      ctx.fillStyle = 'rgba(255,255,255,0.10)';
+      ctx.fillRect(r.x, baseY + 3, r.w, 1);
+
+      // faint track name (only chrome besides hairlines)
+      ctx.fillStyle = ui.hover === i ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.17)';
+      ctx.fillText(Econ.TRACKS[i].name, cx, baseY + 15);
+    }
+
+    // hover label
+    if (ui.hover >= 0) {
+      var j = ui.hover, rr = rects[j];
+      var cx2 = rr.x + rr.w / 2;
+      var tr = Econ.TRACKS[j];
+      var line = ui.unlocked[j]
+        ? tr.name + ' ' + ui.levels[j] + '  ' + Econ.fmt(ui.costs[j]) + '  +' + ui.gains[j] + '%'
+        : tr.name + '  \u22ee ' + tr.unlock;
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.fillText(line, cx2, rr.y - 20);
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.fillText(ui.unlocked[j] ? tr.hint : 'locked', cx2, rr.y - 8);
+    }
+
+    ctx.restore();
+  }
+
+  // one dim line + one faint focus mark. nothing else.
+  function drawTut(view) {
+    var t = view.ui.tut;
+    if (!t || t.step >= t.total) return;
+    var rects = view.ui.rects;
+    ctx.save();
+    ctx.textAlign = 'center';
+
+    if (t.focus === 'tick' && t.tick >= 0) {
+      var r = rects[t.tick];
+      var puls = 0.5 + 0.5 * Math.sin(tGlobal * 5);
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.2 + 0.4 * puls) + ')';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 5]);
+      ctx.strokeRect(r.x - 5, r.y - 5, r.w + 10, r.h + 10);
+      ctx.setLineDash([]);
+      var ay = r.y - 16 - puls * 4;
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.3 + 0.4 * puls) + ')';
+      ctx.beginPath();
+      ctx.moveTo(r.x + r.w / 2 - 4, ay);
+      ctx.lineTo(r.x + r.w / 2 + 4, ay);
+      ctx.lineTo(r.x + r.w / 2, ay + 5);
+      ctx.closePath();
+      ctx.fill();
+    } else if (t.focus === 'void') {
+      var cx = W / 2, cy = H * 0.74;
+      var puls2 = 0.5 + 0.5 * Math.sin(tGlobal * 3);
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.14 + 0.24 * puls2) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(cx, cy, 30 + 12 * puls2, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2); ctx.fill();
+    }
+
+    ctx.font = mono(11);
+    ctx.fillStyle = 'rgba(255,255,255,0.52)';
+    ctx.fillText(t.text, W / 2, 62);
+
+    var dw = 11, x0 = W / 2 - (t.total - 1) * dw / 2;
+    for (var i = 0; i < t.total; i++) {
+      ctx.fillStyle = i < t.step ? 'rgba(255,255,255,0.4)'
+        : i === t.step ? 'rgba(255,255,255,0.75)'
+        : 'rgba(255,255,255,0.14)';
+      ctx.fillRect(x0 + i * dw - 1.5, 74, 3, 3);
+    }
+    ctx.restore();
+  }
+
+  function drawWin(view) {
+    if (!view.ui.win) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.58)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '200 64px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.94)';
+    drawSpaced(ctx, 'harmony', W / 2, H / 2 - 14, 22);
+    ctx.font = mono(12);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillText(Econ.mmss(view.ui.winTime) + '  \u00b7  360/360  \u00b7  press r', W / 2, H / 2 + 44);
+    ctx.restore();
+  }
+
+  var ctx = document.getElementById('c').getContext('2d', { alpha: false });
+
+  function frame(view, dt) {
+    update(dt, view);
+
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+
+    drawBackground(view);
+
+    ctx.save();
+    if (shake > 0.05) {
+      ctx.translate(rand(-shake, shake), rand(-shake, shake));
+    }
+    drawMandala(view);
+    drawGrid();
+    drawScope();
+    drawTrails(view);
+    drawPendulums(view);
+    drawParts();
+    drawOverdrive(view);
+    ctx.restore();
+
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, W, H);
+
+    if (grainPattern) {
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.translate(-((Math.random() * 128) | 0), -((Math.random() * 128) | 0));
+      ctx.fillStyle = grainPattern;
+      ctx.fillRect(0, 0, W + 128, H + 128);
+      ctx.restore();
+    }
+
+    drawHUD(view);
+    drawStrip(view);
+    drawFocus(view);
+    drawTut(view);
+    drawWin(view);
+  }
+
+  return {
+    resize: resize, frame: frame, setPhase: setPhase,
+    spark: spark, ring: ring, float: float, boom: boom, pop: pop
+  };
+})();
+
+</script>
+<script>
+/* ==== js/game.js ==== */
+/* game.js — state, input, loop. Physics + economy + minimalist chrome. */
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+
+  // never hard-crash if audio.js is missing/blocked: every sfx call no-ops
+  var sfx = (typeof Sfx !== 'undefined') ? Sfx : {
+    unlock: function () {}, strike: function () {}, pulse: function () {},
+    sync: function () {}, buy: function () {}, phase: function () {},
+    od: function () {}, win: function () {}, focus: function () {},
+    toggle: function () { return false; }, isMuted: function () { return false; }
+  };
+
+  var W = 0, H = 0, DPR = 1;
+  var S = Econ.create();
+  var elapsed = 0, won = false, winTime = 0;
+  var pends = [];
+  var cfg = null;
+  var geom = [];
+  var L1 = 0, L2 = 0, pivots = [];
+  var phase = -1, pendCount = 1;
+  var charge = 0, odOn = false, odTimer = 0;
+  var swing01 = 0.93, rate = 0;
+  var hover = -1, drag = null;
+  var pointer = { x: -1, y: -1 };
+  var last = performance.now(), acc = 0;
+  var FIXED = 1 / 240;
+
+  // resonance timing: bob crossing the bottom opens a short window
+  var syncWin = [], prevSign = [], prevX = [], prevY = [];
+  var boost = 0;          // fling/pulse boost, decays over ~6s
+  var focusHover = -1;
+
+  // ---- tutorial (runs once per page load) ------------------------------
+  var TUT = [
+    'the pendulum pays \u223f as it swings \u00b7 watch',
+    'click the void \u00b7 a pulse feeds the swing',
+    'click a tick below \u00b7 buy a level',
+    'hover a tick \u00b7 name \u00b7 cost \u00b7 next',
+    'drag a bob \u00b7 fling it harder',
+    'shift-click a tick \u00b7 buy 50'
+  ];
+  var TUT_TIMEOUT = [7, 14, 30, 14, 20, 16];
+  var tutStep = 0, tutTime = 0, tutDwell = 0;
+
+  function tutAdvance() {
+    if (tutStep >= TUT.length) return;
+    tutStep++;
+    tutTime = 0;
+    tutDwell = 0;
+  }
+
+  function tutTickIndex() {
+    var best = -1, bl = Infinity;
+    for (var i = 0; i < Econ.TRACKS.length; i++) {
+      if (!Econ.unlocked(S, i)) continue;
+      if (S.levels[i] < bl) { bl = S.levels[i]; best = i; }
+    }
+    return best;
+  }
+
+  var COL_GAP = 6, STRIP_H = 30;
+
+  function colWidth() {
+    return Math.max(24, Math.min(42, (W - 40) / Econ.TRACKS.length - COL_GAP));
+  }
+
+  // ---- layout ----------------------------------------------------------
+
+  function stripRects() {
+    var n = Econ.TRACKS.length;
+    var cw = colWidth();
+    var totalW = n * cw + (n - 1) * COL_GAP;
+    var x0 = Math.round(W / 2 - totalW / 2);
+    var top = H - 44 - STRIP_H;
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      out.push({ x: Math.round(x0 + i * (cw + COL_GAP)), y: top, w: cw, h: STRIP_H + 18, i: i });
+    }
+    return out;
+  }
+
+  function computeLayout() {
+    var m = Math.min(W, H);
+    L1 = m * 0.17;
+    L2 = m * 0.15;
+    pendCount = 1 + Math.min(6, Math.floor(S.levels[4] / 6));
+    pivots = [];
+    var gap = pendCount > 1 ? Math.min(W * 0.86 / (pendCount - 1), m * 0.34) : 0;
+    var cx = W / 2, cy = H * 0.42;
+    for (var i = 0; i < pendCount; i++) {
+      pivots.push({ x: cx + (i - (pendCount - 1) / 2) * gap, y: cy });
+    }
+    while (pends.length < pendCount) {
+      pends.push({ st: Phys.make(pends.length * 0.9), trail: [] });
+    }
+    while (pends.length > pendCount) pends.pop();
+
+    var m2 = 1 + 0.04 * Math.min(40, S.levels[1]);
+    cfg = {
+      m1: 1, m2: m2,
+      b: 0.14 / (1 + 0.08 * S.levels[0]),
+      push: 3.2 + 0.1 * S.levels[3],
+      target: 0.55 * Phys.G * (1 + 2 * m2)
+    };
+  }
+
+  function computeGeom() {
+    geom = [];
+    var m = Math.min(W, H);
+    var r = m * 0.022 * Math.min(2.2, 1 + 0.02 * S.levels[1]);
+    for (var i = 0; i < pends.length; i++) {
+      var pv = pivots[i];
+      var st = pends[i].st;
+      // screen mapping: offset = (sin t * L, cos t * L) -> t=0 hangs down
+      var s1 = Math.sin(st[0]), c1 = Math.cos(st[0]);
+      var s2 = Math.sin(st[2]), c2 = Math.cos(st[2]);
+      var ex = pv.x + s1 * L1, ey = pv.y + c1 * L1;
+      geom.push({
+        px: pv.x, py: pv.y,
+        x1: ex, y1: ey,
+        x2: ex + s2 * L2, y2: ey + c2 * L2,
+        r: r, trail: pends[i].trail
+      });
+    }
+  }
+
+  // ---- economy / simulation -------------------------------------------
+
+  function progressNow() { return Econ.progress(S); }
+
+  function focusZones() {
+    var zones = [], n = 3, w = 116, gap = 14;
+    var total = n * w + (n - 1) * gap;
+    var x0 = Math.round(W / 2 - total / 2);
+    var y = Math.round(H * 0.80);
+    for (var a = 0; a < n; a++) {
+      zones.push({
+        x: x0 + a * (w + gap), y: y, w: w, h: 34,
+        arch: a, mult: Econ.focusMult(S, a)
+      });
+    }
+    return zones;
+  }
+
+  function hitFocus(x, y) {
+    if (won || Econ.pending(S) < 0) return -1;
+    var z = focusZones();
+    for (var a = 0; a < z.length; a++) {
+      if (x >= z[a].x && x <= z[a].x + z[a].w && y >= z[a].y && y <= z[a].y + z[a].h) return a;
+    }
+    return -1;
+  }
+
+  function chooseFocus(arch) {
+    if (Econ.pending(S) < 0) return;
+    Econ.choose(S, arch);
+    var z = focusZones()[arch];
+    var hue = (phase * 27 + arch * 47) % 360;
+    Render.ring(z.x + z.w / 2, z.y + z.h / 2, hue, true);
+    Render.float(z.x + z.w / 2, z.y - 12, 'focus \u00d7' + Econ.focusMult(S, arch).toFixed(2), hue);
+    Render.spark(z.x + z.w / 2, z.y + z.h / 2, hue, 26, 170);
+    Render.boom(10); Render.pop();
+    sfx.focus();
+  }
+
+  function syncPhase() {
+    var p = Math.min(12, Math.floor(progressNow() / 30));
+    if (p !== phase) {
+      var first = phase < 0;
+      phase = p;
+      Render.setPhase(p);
+      if (!first) { Render.pop(); Render.boom(4); sfx.phase(); }
+    }
+  }
+
+  function odRatePerSec() { return Econ.odRate(S); }
+  function odDuration() { return Econ.odDuration(S); }
+
+  // bottom-crossing detection: opens the resonance window, plays the strike
+  function detectSync(dt) {
+    var reach = L1 + L2;
+    for (var i = 0; i < pends.length; i++) {
+      var g = geom[i];
+      if (!g) continue;
+      var dx = g.x2 - g.px;
+      var s = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+      var prev = prevSign[i] || 0;
+      if (s !== 0 && prev !== 0 && s !== prev && (g.y2 - g.py) / reach > 0.2) {
+        syncWin[i] = 0.22;
+        var spd = prevX[i] !== undefined
+          ? Math.hypot(g.x2 - prevX[i], g.y2 - prevY[i]) / Math.max(dt, 0.001)
+          : 0;
+        sfx.strike(Math.min(1500, spd));
+      }
+      prevSign[i] = s;
+      prevX[i] = g.x2;
+      prevY[i] = g.y2;
+      if (syncWin[i] > 0) syncWin[i] -= dt;
+    }
+  }
+
+  function tickEconomy(dt) {
+    var v = 0;
+    for (var i = 0; i < pends.length; i++) v += Phys.vigour(pends[i].st, cfg);
+    swing01 = (pends.length ? v / pends.length : 0) + 0.20 * boost;
+    boost = Math.max(0, boost - dt / 6);
+
+    if (!won) {
+      if (odOn) {
+        odTimer -= dt;
+        if (odTimer <= 0) { odOn = false; charge = 0; }
+      } else {
+        charge += odRatePerSec() * dt;
+        if (charge >= 1) {
+          charge = 1;
+          odOn = true;
+          odTimer = odDuration();
+          Render.boom(11); Render.pop();
+          sfx.od();
+          for (var k = 0; k < pends.length; k++) {
+            Render.ring(geom[k] ? geom[k].x2 : W / 2, geom[k] ? geom[k].y2 : H / 2, (phase * 27 + 140) % 360, true);
+          }
+        }
+      }
+      rate = Econ.liveRate(S, swing01, odOn);
+      S.money += rate * dt;
+      elapsed += dt;
+    } else {
+      rate = 0;
+    }
+    syncPhase();
+  }
+
+  function buy(i, times) {
+    if (won) return false;
+    var rects = stripRects();
+    var cx = rects[i].x + rects[i].w / 2;
+    var baseY = rects[i].y + STRIP_H;
+    if (!Econ.unlocked(S, i)) {
+      Render.float(cx, baseY - STRIP_H - 10, '\u22ee locked', (phase * 27) % 360);
+      return false;
+    }
+    var n = 0;
+    for (var k = 0; k < times; k++) {
+      if (!Econ.buy(S, i)) break;
+      n++;
+    }
+    if (!n) {
+      Render.float(cx, baseY - STRIP_H - 10, Econ.fmt(Econ.cost(S, i)), (phase * 27) % 360);
+      return false;
+    }
+    var hue = (phase * 27 + i * 27) % 360;
+    Render.ring(cx, baseY - 6, hue, false);
+    Render.float(cx, baseY - STRIP_H - 14, Econ.TRACKS[i].name + ' ' + S.levels[i], hue);
+    Render.spark(cx, baseY - 6, hue, 14, 140);
+    Render.boom(n > 1 ? 9 : 4);
+    if (n === 1) Render.pop();
+    sfx.buy();
+
+    if (Econ.isWin(S) && !won) {
+      won = true;
+      winTime = elapsed;
+      Render.boom(24); Render.pop();
+      Render.float(W / 2, H / 2, 'harmony', (phase * 27 + 140) % 360);
+      sfx.win();
+    }
+    if (tutStep === 2) tutAdvance();
+    else if (tutStep === 5 && times > 1) tutAdvance();
+    return true;
+  }
+
+  // ---- input -----------------------------------------------------------
+
+  function hitStrip(x, y) {
+    var rects = stripRects();
+    for (var i = 0; i < rects.length; i++) {
+      var r = rects[i];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+
+  function hitBob(x, y) {
+    var best = -1, bestPart = 0, bestD = 46;
+    for (var i = 0; i < geom.length; i++) {
+      var g = geom[i];
+      var d1 = Math.hypot(x - g.x1, y - g.y1);
+      var d2 = Math.hypot(x - g.x2, y - g.y2);
+      if (d1 < bestD) { bestD = d1; best = i; bestPart = 1; }
+      if (d2 < bestD) { bestD = d2; best = i; bestPart = 2; }
+    }
+    return best < 0 ? null : { pi: best, part: bestPart };
+  }
+
+  canvas.addEventListener('pointermove', function (e) {
+    pointer.x = e.clientX; pointer.y = e.clientY;
+    hover = hitStrip(pointer.x, pointer.y);
+    focusHover = hitFocus(pointer.x, pointer.y);
+    if (drag) applyDrag();
+    canvas.style.cursor = (focusHover >= 0 || hover >= 0 || hitBob(pointer.x, pointer.y)) ? 'pointer' : 'crosshair';
+  });
+
+  canvas.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    sfx.unlock();
+    pointer.x = e.clientX; pointer.y = e.clientY;
+
+    var fz = hitFocus(pointer.x, pointer.y);
+    if (fz >= 0) { chooseFocus(fz); return; }
+
+    var i = hitStrip(pointer.x, pointer.y);
+    if (i >= 0) { buy(i, e.shiftKey ? 50 : 1); return; }
+    var b = hitBob(pointer.x, pointer.y);
+    if (b) { drag = b; return; }
+
+    // void pulse: kick every pendulum + fling boost
+    for (var k = 0; k < pends.length; k++) {
+      var st = pends[k].st;
+      var dir = st[1] >= 0 ? 1 : -1;
+      st[1] += dir * 1.15;
+      st[3] += dir * 0.7;
+    }
+    boost = 1;
+
+    // resonance: a pulse inside the timing window pays out
+    var hit = -1;
+    for (k = 0; k < pends.length; k++) {
+      if (syncWin[k] > 0) { hit = k; break; }
+    }
+    if (hit >= 0) {
+      syncWin[hit] = 0;
+      if (!won) {
+        S.money += rate * 0.5;
+        if (!odOn) charge = Math.min(1, charge + 0.3);
+      }
+      var hg = geom[hit];
+      var shue = (phase * 27 + 140) % 360;
+      Render.ring(hg.x2, hg.y2, shue, true);
+      Render.float(hg.x2, hg.y2 - 34, 'sync', shue);
+      Render.spark(hg.x2, hg.y2, shue, 30, 200);
+      Render.boom(9); Render.pop();
+      sfx.sync();
+    } else {
+      Render.ring(pointer.x, pointer.y, (phase * 27 + 140) % 360, false);
+      Render.spark(pointer.x, pointer.y, (phase * 27) % 360, 10, 130);
+      Render.boom(3);
+      sfx.pulse();
+    }
+    if (tutStep === 1) tutAdvance();
+  });
+
+  window.addEventListener('pointerup', function () {
+    if (drag) {
+      boost = 1;
+      if (tutStep === 4) tutAdvance();
+    }
+    drag = null;
+  });
+  window.addEventListener('pointercancel', function () { drag = null; });
+  window.addEventListener('blur', function () { drag = null; });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'r' || e.key === 'R') restart();
+    if (e.key === 'm' || e.key === 'M') {
+      var mu = sfx.toggle();
+      Render.float(W / 2, 62, mu ? 'muted' : 'sound', (phase * 27 + 140) % 360);
+    }
+  });
+
+  function applyDrag() {
+    if (!drag || drag.pi >= pends.length) return;
+    var g = geom[drag.pi];
+    if (!g) return;
+    var st = pends[drag.pi].st;
+    if (drag.part === 1) {
+      // screen offset = (sin t * L, cos t * L) -> t = atan2(dx, dy)
+      var target = Math.atan2(pointer.x - g.px, pointer.y - g.py);
+      var prev = st[0];
+      st[0] = prev + (target - prev) * 0.5;
+      st[1] = Math.max(-18, Math.min(18, (st[0] - prev) / Math.max(1 / 120, lastDt)));
+    } else {
+      var target2 = Math.atan2(pointer.x - g.x1, pointer.y - g.y1);
+      var prev2 = st[2];
+      st[2] = prev2 + (target2 - prev2) * 0.5;
+      st[3] = Math.max(-18, Math.min(18, (st[2] - prev2) / Math.max(1 / 120, lastDt)));
+    }
+  }
+
+  function restart() {
+    S = Econ.create();
+    elapsed = 0; won = false; winTime = 0;
+    charge = 0; odOn = false; odTimer = 0; phase = -1;
+    pends = []; drag = null; hover = -1; focusHover = -1;
+    syncWin = []; prevSign = []; prevX = []; prevY = [];
+    boost = 0;
+    computeLayout(); computeGeom(); syncPhase();
+    Render.setPhase(0);
+  }
+
+  // ---- loop ------------------------------------------------------------
+
+  var lastDt = 1 / 60;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    lastDt = dt;
+
+    computeLayout();
+    computeGeom();
+    if (drag) applyDrag();
+
+    acc += dt;
+    var steps = 0;
+    while (acc >= FIXED && steps < 480) {
+      for (var i = 0; i < pends.length; i++) {
+        Phys.step(pends[i].st, FIXED, cfg, drag && drag.pi === i);
+      }
+      acc -= FIXED;
+      steps++;
+    }
+    if (steps >= 480) acc = 0;
+
+    computeGeom();
+    tickEconomy(dt);
+    detectSync(dt);
+
+    // tutorial progression
+    if (tutStep < TUT.length) {
+      tutTime += dt;
+      if (tutStep === 3) {
+        if (hover >= 0) {
+          tutDwell += dt;
+          if (tutDwell > 1.5) tutAdvance();
+        } else {
+          tutDwell = 0;
+        }
+      }
+      if (tutStep < TUT.length && tutTime > TUT_TIMEOUT[tutStep]) tutAdvance();
+    }
+
+    // trails
+    for (i = 0; i < pends.length; i++) {
+      var g = geom[i];
+      var tr = pends[i].trail;
+      tr.push([g.x2, g.y2]);
+      if (tr.length > 96) tr.shift();
+    }
+
+    var rects = stripRects();
+    var levels = S.levels.slice();
+    var unlockedA = [], affordA = [], costsA = [], gainsA = [];
+    for (i = 0; i < Econ.TRACKS.length; i++) {
+      unlockedA.push(Econ.unlocked(S, i));
+      affordA.push(Econ.canBuy(S, i));
+      costsA.push(Econ.cost(S, i));
+      gainsA.push(Math.round(Econ.gainPct(i) * 100));
+    }
+
+    var syncs = [];
+    for (i = 0; i < pends.length; i++) syncs.push(Math.max(0, syncWin[i] || 0) / 0.22);
+
+    var pend = Econ.pending(S);
+    var focusUI = null;
+    if (pend >= 0 && !won) {
+      focusUI = { zones: focusZones(), hover: focusHover, index: pend };
+    }
+
+    var energy = 0;
+    for (i = 0; i < pends.length; i++) energy += Phys.vigour(pends[i].st, cfg);
+    energy = pends.length ? energy / pends.length : 0;
+
+    var view = {
+      W: W, H: H, dpr: DPR, time: elapsed,
+      pends: geom, energy01: energy, odOn: odOn, phase: phase,
+      headAngle: pends.length ? pends[0].st[0] : 0,
+      harv: S.levels[2], aura: S.levels[5],
+      ui: {
+        money: S.money, rate: rate,
+        mult: Econ.income(S) / Econ.BASE,
+        clock: Econ.mmss(elapsed),
+        progress: progressNow(), win: won, winTime: winTime,
+        rects: rects, hover: hover, levels: levels,
+        unlocked: unlockedA, afford: affordA, costs: costsA, gains: gainsA,
+        focus: focusUI, charge: Math.min(1, charge),
+        tut: {
+          step: tutStep, total: TUT.length,
+          text: tutStep < TUT.length ? TUT[tutStep] : '',
+          focus: tutStep === 1 ? 'void' : (tutStep === 2 ? 'tick' : null),
+          tick: tutTickIndex()
+        }
+      },
+      syncs: syncs
+    };
+
+    Render.frame(view, dt);
+    requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    Render.resize(W, H, DPR);
+    computeLayout();
+    computeGeom();
+  }
+
+  window.addEventListener('resize', resize);
+
+  resize();
+  syncPhase();
+  requestAnimationFrame(frame);
+
+  window.__game = {
+    state: function () { return S; },
+    buy: buy, restart: restart,
+    tutSet: function (n) { tutStep = n; tutTime = 0; tutDwell = 0; },
+    view: function () {
+      return {
+        money: S.money, levels: S.levels.slice(), elapsed: elapsed,
+        won: won, rate: rate, tut: tutStep,
+        progress: Econ.progress(S), pending: Econ.pending(S),
+        keystones: S.keystones.slice(), syncs: syncWin.slice(),
+        dy0: geom[0] ? geom[0].y2 - geom[0].py : 0,
+        y2s: geom.map(function (g) { return Math.round(g.y2); }),
+        bobs: geom.map(function (g) {
+          return [Math.round(g.x1), Math.round(g.y1), Math.round(g.x2), Math.round(g.y2), Math.round(g.px), Math.round(g.py)];
+        })
+      };
+    }
+  };
+})();
+
+</script>
+</body>
+</html>

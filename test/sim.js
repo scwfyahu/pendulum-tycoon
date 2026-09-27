@@ -1,68 +1,36 @@
-/* sim.js — autonomous playthrough, checks pacing toward ~1 hour. */
+/* sim.js — three autonomous playthroughs, all zero-skill (swing 0.93,
+   modelled overdrive, no resonance timing bonuses):
+   1. GOOD — highest gain per resonance spent each buy  -> must land ~1 hour
+   2. NOOB — always the highest gain% track (the "SURGE feels strong" trap)
+   3. CHEAP— lowest gain per resonance
+   Gap proves the build decision matters. */
 'use strict';
 var Econ = require('../js/econ.js');
+var sim = require('./simrun.js');
 
-function run() {
-  var s = Econ.create();
-  var dt = 0.25, t = 0, buys = 0;
-  var events = [];
-  var seen = {};
-  var prevPhase = 0;
+var good = sim.run(sim.policies.GOOD);
+var noob = sim.run(sim.policies.NOOB);
+var cheap = sim.run(sim.policies.CHEAP);
 
-  while (!Econ.isWin(s) && t < 400000) {
-    // greedy: always cheapest = lowest level (equal per-level cost across tracks)
-    var guard = 0;
-    for (;;) {
-      if (guard++ > 2000) throw new Error('buy loop guard');
-      var best = -1, bl = Infinity;
-      for (var i = 0; i < Econ.TRACKS.length; i++) {
-        if (!Econ.unlocked(s, i)) continue;
-        if (s.levels[i] < bl) { bl = s.levels[i]; best = i; }
-      }
-      if (best < 0) break;
-      if (Econ.buy(s, best)) { buys++; continue; }
-      break;
-    }
-
-    for (var j = 0; j < Econ.TRACKS.length; j++) {
-      var tr = Econ.TRACKS[j];
-      if (tr.unlock > 0 && !seen[tr.id] && Econ.unlocked(s, j)) {
-        seen[tr.id] = 1;
-        events.push(Econ.mmss(t) + '  unlock ' + tr.name);
-      }
-    }
-
-    var ph = Math.min(12, Math.floor(Econ.total(s) / 30));
-    if (ph !== prevPhase) {
-      events.push(Econ.mmss(t) + '  phase ' + ph + '  (' + Econ.total(s) + ' levels)');
-      prevPhase = ph;
-    }
-
-    t += dt;
-    s.money += Econ.avgRate(s) * dt;
-  }
-
-  if (!Econ.isWin(s)) throw new Error('did not finish in time budget');
-
-  return {
-    seconds: t, buys: buys, levels: s.levels.slice(),
-    rate: Econ.avgRate(s), money: s.money, events: events
-  };
+function show(tag, r) {
+  console.log(tag + ' time  : ' + Econ.mmss(r.seconds) + '  (' + Math.round(r.seconds) + 's)' +
+              '  end ' + Econ.fmt(r.rate) + '/s  levels ' + r.levels.join(','));
 }
-
-var r = run();
-console.log('time      : ' + Econ.mmss(r.seconds) + '  (' + Math.round(r.seconds) + 's)');
-console.log('buys      : ' + r.buys);
-console.log('levels    : ' + r.levels.join(','));
-console.log('end rate  : ' + Econ.fmt(r.rate) + '/s');
-console.log('end cash  : ' + Econ.fmt(r.money));
-console.log('timeline  :');
-r.events.forEach(function (e) { console.log('  ' + e); });
+show('GOOD', good);
+console.log('GOOD timeline:');
+good.events.forEach(function (e) { console.log('  ' + e); });
+show('NOOB', noob);
+show('CHEAP', cheap);
 
 var lo = 3480, hi = 3780;
-if (r.seconds < lo || r.seconds > hi) {
-  console.log('PACE OFF target 3600 [' + lo + ',' + hi + '] -> scale C0 by ' + (3600 / r.seconds).toFixed(4));
-  process.exitCode = 1;
-} else {
-  console.log('PACE OK ~1 hour');
-}
+var paceOK = good.seconds >= lo && good.seconds <= hi;
+var gapNoob = noob.seconds / good.seconds;
+var gapCheap = cheap.seconds / good.seconds;
+var gap = Math.max(gapNoob, gapCheap);
+
+console.log('pace     : ' + (paceOK ? 'OK ~1 hour'
+  : 'OFF -> scale SCALE by ' + (3600 / good.seconds).toFixed(4)));
+console.log('choice   : noob x' + gapNoob.toFixed(2) + ', cheap x' + gapCheap.toFixed(2) +
+  (gap >= 1.35 ? '  MATTERS' : '  TOO WEAK'));
+
+process.exitCode = (paceOK && gap >= 1.35) ? 0 : 1;

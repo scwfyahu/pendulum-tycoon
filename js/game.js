@@ -4,6 +4,14 @@
 
   var canvas = document.getElementById('c');
 
+  // never hard-crash if audio.js is missing/blocked: every sfx call no-ops
+  var sfx = (typeof Sfx !== 'undefined') ? Sfx : {
+    unlock: function () {}, strike: function () {}, pulse: function () {},
+    sync: function () {}, buy: function () {}, phase: function () {},
+    od: function () {}, win: function () {}, focus: function () {},
+    toggle: function () { return false; }, isMuted: function () { return false; }
+  };
+
   var W = 0, H = 0, DPR = 1;
   var S = Econ.create();
   var elapsed = 0, won = false, winTime = 0;
@@ -18,6 +26,11 @@
   var pointer = { x: -1, y: -1 };
   var last = performance.now(), acc = 0;
   var FIXED = 1 / 240;
+
+  // resonance timing: bob crossing the bottom opens a short window
+  var syncWin = [], prevSign = [], prevX = [], prevY = [];
+  var boost = 0;          // fling/pulse boost, decays over ~6s
+  var focusHover = -1;
 
   // ---- tutorial (runs once per page load) ------------------------------
   var TUT = [
@@ -115,25 +128,84 @@
 
   // ---- economy / simulation -------------------------------------------
 
-  function totalLevels() { return Econ.total(S); }
+  function progressNow() { return Econ.progress(S); }
+
+  function focusZones() {
+    var zones = [], n = 3, w = 116, gap = 14;
+    var total = n * w + (n - 1) * gap;
+    var x0 = Math.round(W / 2 - total / 2);
+    var y = Math.round(H * 0.80);
+    for (var a = 0; a < n; a++) {
+      zones.push({
+        x: x0 + a * (w + gap), y: y, w: w, h: 34,
+        arch: a, mult: Econ.focusMult(S, a)
+      });
+    }
+    return zones;
+  }
+
+  function hitFocus(x, y) {
+    if (won || Econ.pending(S) < 0) return -1;
+    var z = focusZones();
+    for (var a = 0; a < z.length; a++) {
+      if (x >= z[a].x && x <= z[a].x + z[a].w && y >= z[a].y && y <= z[a].y + z[a].h) return a;
+    }
+    return -1;
+  }
+
+  function chooseFocus(arch) {
+    if (Econ.pending(S) < 0) return;
+    Econ.choose(S, arch);
+    var z = focusZones()[arch];
+    var hue = (phase * 27 + arch * 47) % 360;
+    Render.ring(z.x + z.w / 2, z.y + z.h / 2, hue, true);
+    Render.float(z.x + z.w / 2, z.y - 12, 'focus \u00d7' + Econ.focusMult(S, arch).toFixed(2), hue);
+    Render.spark(z.x + z.w / 2, z.y + z.h / 2, hue, 26, 170);
+    Render.boom(10); Render.pop();
+    sfx.focus();
+  }
 
   function syncPhase() {
-    var p = Math.min(12, Math.floor(totalLevels() / 30));
+    var p = Math.min(12, Math.floor(progressNow() / 30));
     if (p !== phase) {
       var first = phase < 0;
       phase = p;
       Render.setPhase(p);
-      if (!first) { Render.pop(); Render.boom(4); }
+      if (!first) { Render.pop(); Render.boom(4); sfx.phase(); }
     }
   }
 
   function odRatePerSec() { return Econ.odRate(S); }
   function odDuration() { return Econ.odDuration(S); }
 
+  // bottom-crossing detection: opens the resonance window, plays the strike
+  function detectSync(dt) {
+    var reach = L1 + L2;
+    for (var i = 0; i < pends.length; i++) {
+      var g = geom[i];
+      if (!g) continue;
+      var dx = g.x2 - g.px;
+      var s = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+      var prev = prevSign[i] || 0;
+      if (s !== 0 && prev !== 0 && s !== prev && (g.y2 - g.py) / reach > 0.2) {
+        syncWin[i] = 0.22;
+        var spd = prevX[i] !== undefined
+          ? Math.hypot(g.x2 - prevX[i], g.y2 - prevY[i]) / Math.max(dt, 0.001)
+          : 0;
+        sfx.strike(Math.min(1500, spd));
+      }
+      prevSign[i] = s;
+      prevX[i] = g.x2;
+      prevY[i] = g.y2;
+      if (syncWin[i] > 0) syncWin[i] -= dt;
+    }
+  }
+
   function tickEconomy(dt) {
     var v = 0;
     for (var i = 0; i < pends.length; i++) v += Phys.vigour(pends[i].st, cfg);
-    swing01 = pends.length ? v / pends.length : 0;
+    swing01 = (pends.length ? v / pends.length : 0) + 0.20 * boost;
+    boost = Math.max(0, boost - dt / 6);
 
     if (!won) {
       if (odOn) {
@@ -146,6 +218,7 @@
           odOn = true;
           odTimer = odDuration();
           Render.boom(11); Render.pop();
+          sfx.od();
           for (var k = 0; k < pends.length; k++) {
             Render.ring(geom[k] ? geom[k].x2 : W / 2, geom[k] ? geom[k].y2 : H / 2, (phase * 27 + 140) % 360, true);
           }
@@ -184,12 +257,14 @@
     Render.spark(cx, baseY - 6, hue, 14, 140);
     Render.boom(n > 1 ? 9 : 4);
     if (n === 1) Render.pop();
+    sfx.buy();
 
     if (Econ.isWin(S) && !won) {
       won = true;
       winTime = elapsed;
       Render.boom(24); Render.pop();
       Render.float(W / 2, H / 2, 'harmony', (phase * 27 + 140) % 360);
+      sfx.win();
     }
     if (tutStep === 2) tutAdvance();
     else if (tutStep === 5 && times > 1) tutAdvance();
@@ -222,32 +297,65 @@
   canvas.addEventListener('pointermove', function (e) {
     pointer.x = e.clientX; pointer.y = e.clientY;
     hover = hitStrip(pointer.x, pointer.y);
+    focusHover = hitFocus(pointer.x, pointer.y);
     if (drag) applyDrag();
-    canvas.style.cursor = (hover >= 0 || hitBob(pointer.x, pointer.y)) ? 'pointer' : 'crosshair';
+    canvas.style.cursor = (focusHover >= 0 || hover >= 0 || hitBob(pointer.x, pointer.y)) ? 'pointer' : 'crosshair';
   });
 
   canvas.addEventListener('pointerdown', function (e) {
     e.preventDefault();
+    sfx.unlock();
     pointer.x = e.clientX; pointer.y = e.clientY;
+
+    var fz = hitFocus(pointer.x, pointer.y);
+    if (fz >= 0) { chooseFocus(fz); return; }
+
     var i = hitStrip(pointer.x, pointer.y);
     if (i >= 0) { buy(i, e.shiftKey ? 50 : 1); return; }
     var b = hitBob(pointer.x, pointer.y);
     if (b) { drag = b; return; }
-    // void pulse: nudge every pendulum
+
+    // void pulse: kick every pendulum + fling boost
     for (var k = 0; k < pends.length; k++) {
       var st = pends[k].st;
       var dir = st[1] >= 0 ? 1 : -1;
       st[1] += dir * 1.15;
       st[3] += dir * 0.7;
     }
-    Render.ring(pointer.x, pointer.y, (phase * 27 + 140) % 360, false);
-    Render.spark(pointer.x, pointer.y, (phase * 27) % 360, 10, 130);
-    Render.boom(3);
+    boost = 1;
+
+    // resonance: a pulse inside the timing window pays out
+    var hit = -1;
+    for (k = 0; k < pends.length; k++) {
+      if (syncWin[k] > 0) { hit = k; break; }
+    }
+    if (hit >= 0) {
+      syncWin[hit] = 0;
+      if (!won) {
+        S.money += rate * 0.5;
+        if (!odOn) charge = Math.min(1, charge + 0.3);
+      }
+      var hg = geom[hit];
+      var shue = (phase * 27 + 140) % 360;
+      Render.ring(hg.x2, hg.y2, shue, true);
+      Render.float(hg.x2, hg.y2 - 34, 'sync', shue);
+      Render.spark(hg.x2, hg.y2, shue, 30, 200);
+      Render.boom(9); Render.pop();
+      sfx.sync();
+    } else {
+      Render.ring(pointer.x, pointer.y, (phase * 27 + 140) % 360, false);
+      Render.spark(pointer.x, pointer.y, (phase * 27) % 360, 10, 130);
+      Render.boom(3);
+      sfx.pulse();
+    }
     if (tutStep === 1) tutAdvance();
   });
 
   window.addEventListener('pointerup', function () {
-    if (drag && tutStep === 4) tutAdvance();
+    if (drag) {
+      boost = 1;
+      if (tutStep === 4) tutAdvance();
+    }
     drag = null;
   });
   window.addEventListener('pointercancel', function () { drag = null; });
@@ -255,6 +363,10 @@
 
   window.addEventListener('keydown', function (e) {
     if (e.key === 'r' || e.key === 'R') restart();
+    if (e.key === 'm' || e.key === 'M') {
+      var mu = sfx.toggle();
+      Render.float(W / 2, 62, mu ? 'muted' : 'sound', (phase * 27 + 140) % 360);
+    }
   });
 
   function applyDrag() {
@@ -280,7 +392,9 @@
     S = Econ.create();
     elapsed = 0; won = false; winTime = 0;
     charge = 0; odOn = false; odTimer = 0; phase = -1;
-    pends = []; drag = null; hover = -1;
+    pends = []; drag = null; hover = -1; focusHover = -1;
+    syncWin = []; prevSign = []; prevX = []; prevY = [];
+    boost = 0;
     computeLayout(); computeGeom(); syncPhase();
     Render.setPhase(0);
   }
@@ -311,6 +425,7 @@
 
     computeGeom();
     tickEconomy(dt);
+    detectSync(dt);
 
     // tutorial progression
     if (tutStep < TUT.length) {
@@ -336,11 +451,21 @@
 
     var rects = stripRects();
     var levels = S.levels.slice();
-    var unlockedA = [], affordA = [], costsA = [];
+    var unlockedA = [], affordA = [], costsA = [], gainsA = [];
     for (i = 0; i < Econ.TRACKS.length; i++) {
       unlockedA.push(Econ.unlocked(S, i));
       affordA.push(Econ.canBuy(S, i));
       costsA.push(Econ.cost(S, i));
+      gainsA.push(Math.round(Econ.gainPct(i) * 100));
+    }
+
+    var syncs = [];
+    for (i = 0; i < pends.length; i++) syncs.push(Math.max(0, syncWin[i] || 0) / 0.22);
+
+    var pend = Econ.pending(S);
+    var focusUI = null;
+    if (pend >= 0 && !won) {
+      focusUI = { zones: focusZones(), hover: focusHover, index: pend };
     }
 
     var energy = 0;
@@ -356,16 +481,18 @@
         money: S.money, rate: rate,
         mult: Econ.income(S) / Econ.BASE,
         clock: Econ.mmss(elapsed),
-        total: totalLevels(), win: won, winTime: winTime,
+        progress: progressNow(), win: won, winTime: winTime,
         rects: rects, hover: hover, levels: levels,
-        unlocked: unlockedA, afford: affordA, costs: costsA,
+        unlocked: unlockedA, afford: affordA, costs: costsA, gains: gainsA,
+        focus: focusUI, charge: Math.min(1, charge),
         tut: {
           step: tutStep, total: TUT.length,
           text: tutStep < TUT.length ? TUT[tutStep] : '',
           focus: tutStep === 1 ? 'void' : (tutStep === 2 ? 'tick' : null),
           tick: tutTickIndex()
         }
-      }
+      },
+      syncs: syncs
     };
 
     Render.frame(view, dt);
@@ -395,6 +522,8 @@
       return {
         money: S.money, levels: S.levels.slice(), elapsed: elapsed,
         won: won, rate: rate, tut: tutStep,
+        progress: Econ.progress(S), pending: Econ.pending(S),
+        keystones: S.keystones.slice(), syncs: syncWin.slice(),
         dy0: geom[0] ? geom[0].y2 - geom[0].py : 0,
         y2s: geom.map(function (g) { return Math.round(g.y2); }),
         bobs: geom.map(function (g) {

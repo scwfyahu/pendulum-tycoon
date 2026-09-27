@@ -279,7 +279,6 @@ var Render = (function () {
     for (var p = 0; p < view.pends.length; p++) {
       var pd = view.pends[p];
       var hue = (h0 + p * 24) % 360;
-
       // rods: cheap layered glow (no shadowBlur — it tanks fill-rate)
       ctx.save();
       ctx.lineCap = 'round';
@@ -309,6 +308,25 @@ var Render = (function () {
       joint(pd.px, pd.py, 3.2, hue);
       joint(pd.x1, pd.y1, pd.r * 0.42, hue);
       bob(pd.x2, pd.y2, pd.r, hue, p);
+
+      // resonance window: the bob is a live target for ~0.22s
+      var sync = view.syncs ? view.syncs[p] : 0;
+      if (sync > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        var sr = pd.r * (2.1 + (1 - sync) * 1.3);
+        ctx.strokeStyle = 'rgba(255,255,255,' + (0.3 + 0.6 * sync) + ')';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(pd.x2, pd.y2, sr, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.45 + 0.5 * sync) + ')';
+        ctx.beginPath();
+        ctx.moveTo(pd.x2 - 6, pd.y2 - sr - 9);
+        ctx.lineTo(pd.x2 + 6, pd.y2 - sr - 9);
+        ctx.lineTo(pd.x2, pd.y2 - sr - 3);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
     }
   }
 
@@ -429,7 +447,37 @@ var Render = (function () {
     ctx.fillStyle = 'rgba(255,255,255,0.26)';
     ctx.fillText(Econ.fmt(ui.rate) + '/s', 16, 40);
     ctx.fillStyle = 'rgba(255,255,255,0.2)';
-    ctx.fillText(ui.total + '/' + Econ.WIN, 16 + ctx.measureText(Econ.fmt(ui.rate) + '/s').width + 12, 40);
+    ctx.fillText(ui.progress + '/' + Econ.WIN, 16 + ctx.measureText(Econ.fmt(ui.rate) + '/s').width + 12, 40);
+
+    // overdrive charge: one 18px hairline, nothing more
+    if (ui.charge > 0.001 && !ui.win) {
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      ctx.fillRect(16, 47, 60, 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.fillRect(16, 47, 60 * ui.charge, 2);
+    }
+    ctx.restore();
+  }
+
+  // five one-time archetype choices: 3 zones, one line
+  function drawFocus(view) {
+    var f = view.ui.focus;
+    if (!f) return;
+    var names = ['calm', 'flare', 'surge'];
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = mono(10);
+    ctx.fillStyle = 'rgba(255,255,255,0.32)';
+    ctx.fillText('focus \u2014 ' + (f.index + 1) + '/5', W / 2, f.zones[0].y - 16);
+    for (var a = 0; a < f.zones.length; a++) {
+      var z = f.zones[a];
+      var hov = f.hover === a;
+      ctx.font = mono(12);
+      ctx.fillStyle = hov ? 'rgba(255,255,255,0.92)' : 'rgba(255,255,255,0.5)';
+      ctx.fillText(names[a] + ' \u00d7' + z.mult.toFixed(2), z.x + z.w / 2, z.y + 15);
+      ctx.fillStyle = hov ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.18)';
+      ctx.fillRect(z.x + 10, z.y + 24, z.w - 20, hov ? 2 : 1);
+    }
     ctx.restore();
   }
 
@@ -488,7 +536,7 @@ var Render = (function () {
       var cx2 = rr.x + rr.w / 2;
       var tr = Econ.TRACKS[j];
       var line = ui.unlocked[j]
-        ? tr.name + ' ' + ui.levels[j] + '  ' + Econ.fmt(ui.costs[j])
+        ? tr.name + ' ' + ui.levels[j] + '  ' + Econ.fmt(ui.costs[j]) + '  +' + ui.gains[j] + '%'
         : tr.name + '  \u22ee ' + tr.unlock;
       ctx.fillStyle = 'rgba(255,255,255,0.75)';
       ctx.fillText(line, cx2, rr.y - 20);
@@ -599,6 +647,7 @@ var Render = (function () {
 
     drawHUD(view);
     drawStrip(view);
+    drawFocus(view);
     drawTut(view);
     drawWin(view);
   }
