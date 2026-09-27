@@ -49,8 +49,16 @@ Five **keystone choices** (60/120/180/240/300 progress) multiply income by
 `1 + 0.015 × levels of that archetype you already own` — double-down or
 diversify, the answer depends on the build you brought.
 
-Pacing assumes **zero player skill** (swing 0.93, modelled overdrive, no
-resonance hits). Timing and flinging only ever make it faster.
+Pacing assumes **zero player skill** (measured typical speed, modelled
+overdrive, no resonance hits). Timing and flinging only ever make it faster.
+
+## Generation = pendulum speed
+
+`rate = income × (0.60 + 1.10 × speed)` — speed is mean |ω| per rod,
+normalised at 4.05 rad/s. Measured idle mean 2.5 → ×1.28 (the sim baseline),
+near-still pays ×0.60, full tilt pays ×1.70. The `1.2k/s` readout, its 44px
+speed bar and harvest particles all track it frame-for-frame (verified
+correlation 1.0, formula error 0).
 
 ## Layout
 

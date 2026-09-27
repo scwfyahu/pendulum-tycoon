@@ -113,8 +113,8 @@ var Render = (function () {
     hist.push(view.energy01);
     if (hist.length > MAX_HIST) hist.shift();
 
-    // harvest motes
-    var rate = (0.6 + view.harv * 0.16) * view.pends.length;
+    // harvest motes: emission follows live pendulum speed
+    var rate = (0.6 + view.harv * 0.16) * view.pends.length * (0.35 + 0.9 * (view.speed01 || 0));
     for (i = 0; i < view.pends.length; i++) {
       var pd = view.pends[i];
       var emit = Math.min(6, rate * dt / Math.max(1, view.pends.length));
@@ -444,17 +444,24 @@ var Render = (function () {
 
     ctx.font = mono(10);
     ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgba(255,255,255,0.26)';
+    // rate readout breathes with pendulum speed: generation is visible
+    var sp = view.speed01 || 0;
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.2 + 0.6 * sp) + ')';
     ctx.fillText(Econ.fmt(ui.rate) + '/s', 16, 40);
     ctx.fillStyle = 'rgba(255,255,255,0.2)';
     ctx.fillText(ui.progress + '/' + Econ.WIN, 16 + ctx.measureText(Econ.fmt(ui.rate) + '/s').width + 12, 40);
+    // speed bar: generation vs pendulum speed, 0..44px
+    ctx.fillStyle = 'rgba(255,255,255,0.14)';
+    ctx.fillRect(16, 44, 44, 1);
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.3 + 0.55 * sp) + ')';
+    ctx.fillRect(16, 44, 44 * sp, 1);
 
-    // overdrive charge: one 18px hairline, nothing more
+    // overdrive charge: right side, opposite the speed bar
     if (ui.charge > 0.001 && !ui.win) {
       ctx.fillStyle = 'rgba(255,255,255,0.16)';
-      ctx.fillRect(16, 47, 60, 2);
+      ctx.fillRect(W - 16 - 60, 32, 60, 2);
       ctx.fillStyle = 'rgba(255,255,255,0.55)';
-      ctx.fillRect(16, 47, 60 * ui.charge, 2);
+      ctx.fillRect(W - 16 - 60, 32, 60 * ui.charge, 2);
     }
     ctx.restore();
   }

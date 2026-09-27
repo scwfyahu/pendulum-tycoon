@@ -25,8 +25,10 @@
   var BASE = 1;             // base resonance / second
   var WIN_EACH = 0;         // (targets are per-archetype, see ARCH)
   var WIN = 360;            // sum of all track targets (progress denominator)
-  var SWING_MAX = 0.30;     // income bonus from a vigorous swing
-  var SWING_AVG = 0.93;     // typical vigour without player input (sim assumption)
+  var SWING_MIN = 0.60;     // near-still pendulum pays 0.6x
+  var SWING_K = 1.10;       // full tilt pays +1.1x
+  var SWING_AVG = 0.618;    // measured typical speed01 (omega 2.5 / ref 4.05)
+                            // => speedFactor(SWING_AVG) = 1.279 = sim baseline
   var OD_MULT = 2;          // overdrive multiplier
 
   var ARCH = [
@@ -148,13 +150,19 @@
   function odRate(s)     { return 0.015 + 0.0009 * s.levels[7]; }
   function odUptime(s)   { var d = odDuration(s) * odRate(s); return d / (1 + d); }
 
-  function liveRate(s, swing01, odOn) {
-    return income(s) * (1 + SWING_MAX * swing01) * (odOn ? OD_MULT : 1);
+  // generation follows real pendulum speed: 0.6x still .. 1.7x full tilt
+  function speedFactor(speed01) {
+    var s = speed01 < 0 ? 0 : speed01 > 1 ? 1 : speed01;
+    return SWING_MIN + SWING_K * s;
   }
 
-  // no-skill assumption: swing ~0.93, modelled overdrive uptime
+  function liveRate(s, speed01, odOn) {
+    return income(s) * speedFactor(speed01) * (odOn ? OD_MULT : 1);
+  }
+
+  // no-skill assumption: measured typical speed, modelled overdrive uptime
   function avgRate(s) {
-    return income(s) * (1 + SWING_MAX * SWING_AVG) * (1 + odUptime(s));
+    return income(s) * speedFactor(SWING_AVG) * (1 + odUptime(s));
   }
 
   function canBuy(s, i) { return unlocked(s, i) && s.money >= cost(s, i); }
@@ -218,7 +226,7 @@
     GROW_POW: GROW_POW, setGrowPow: function (v) { GROW_POW = v; },
     HEAT_PER: HEAT_PER, setHeat: function (v) { HEAT_PER = v; },
     BASE: BASE, WIN: WIN, OD_MULT: OD_MULT,
-    SWING_MAX: SWING_MAX, SWING_AVG: SWING_AVG,
+    SWING_MIN: SWING_MIN, SWING_K: SWING_K, SWING_AVG: SWING_AVG, speedFactor: speedFactor,
     ARCH: ARCH, TRACKS: TRACKS, growth: growth, heat: heat, targetOf: function (i) { return TRACKS[i].target; },
     FOCUS_AT: FOCUS_AT, FOCUS_K: FOCUS_K,
     pending: pending, choose: choose, focusMult: focusMult, archLevels: archLevels, keystoneMult: keystoneMult,

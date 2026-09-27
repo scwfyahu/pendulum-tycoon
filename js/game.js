@@ -32,7 +32,8 @@
   var L1 = 0, L2 = 0, pivots = [];
   var phase = -1, pendCount = 1;
   var charge = 0, odOn = false, odTimer = 0;
-  var swing01 = 0.93, rate = 0;
+  var swing01 = 0.93, rate = 0, speed01 = 0;
+  var OMEGA_REF = 4.05;     // rad/s = full tilt (measured idle mean 2.5 => speed01 0.618)
   var hover = -1, drag = null;
   var pointer = { x: -1, y: -1 };
   var last = performance.now(), acc = 0;
@@ -141,6 +142,14 @@
 
   function progressNow() { return Econ.progress(S); }
 
+  function omegaNow() {
+    var om = 0;
+    for (var i = 0; i < pends.length; i++) {
+      om += (Math.abs(pends[i].st[1]) + Math.abs(pends[i].st[3])) * 0.5;
+    }
+    return pends.length ? om / pends.length : 0;
+  }
+
   function focusZones() {
     var zones = [], n = 3, w = 116, gap = 14;
     var total = n * w + (n - 1) * gap;
@@ -213,9 +222,14 @@
   }
 
   function tickEconomy(dt) {
-    var v = 0;
-    for (var i = 0; i < pends.length; i++) v += Phys.vigour(pends[i].st, cfg);
-    swing01 = (pends.length ? v / pends.length : 0) + 0.20 * boost;
+    var om = 0;
+    for (var i = 0; i < pends.length; i++) {
+      om += (Math.abs(pends[i].st[1]) + Math.abs(pends[i].st[3])) * 0.5;
+    }
+    // generation tracks REAL pendulum speed (mean |omega| per rod)
+    var omega = pends.length ? om / pends.length : 0;
+    speed01 = Math.min(1, omega / OMEGA_REF + 0.15 * boost);
+    swing01 = speed01;
     boost = Math.max(0, boost - dt / 6);
 
     if (!won) {
@@ -516,7 +530,8 @@
           tick: tutTickIndex()
         }
       },
-      syncs: syncs
+      syncs: syncs,
+      speed01: speed01
     };
 
     Render.frame(view, dt);
@@ -546,6 +561,7 @@
       return {
         money: S.money, levels: S.levels.slice(), elapsed: elapsed,
         won: won, rate: rate, tut: tutStep,
+        speed01: speed01, omega: omegaNow(),
         progress: Econ.progress(S), pending: Econ.pending(S),
         keystones: S.keystones.slice(), syncs: syncWin.slice(),
         dy0: geom[0] ? geom[0].y2 - geom[0].py : 0,
