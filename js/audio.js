@@ -77,6 +77,10 @@ var Sfx = (function () {
       if (master) master.gain.value = muted ? 0 : 0.3;
       return muted;
     },
-    isMuted: function () { return muted; }
+    isMuted: function () { return muted; },
+
+    // background tab / unfocused window: silence completely
+    suspend: function () { if (ctx && ctx.state === 'running') ctx.suspend(); },
+    resume: function () { if (ctx && ctx.state === 'suspended') ctx.resume(); }
   };
 })();

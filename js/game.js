@@ -9,8 +9,19 @@
     unlock: function () {}, strike: function () {}, pulse: function () {},
     sync: function () {}, buy: function () {}, phase: function () {},
     od: function () {}, win: function () {}, focus: function () {},
-    toggle: function () { return false; }, isMuted: function () { return false; }
+    toggle: function () { return false; }, isMuted: function () { return false; },
+    suspend: function () {}, resume: function () {}
   };
+
+  // pause when the tab is hidden or the window loses focus: no income, no
+  // physics, no sound while in the background
+  var running = true;
+  function setRun(v) {
+    if (v === running) return;
+    running = v;
+    sfx[v ? 'resume' : 'suspend']();
+    if (v) last = performance.now();
+  }
 
   var W = 0, H = 0, DPR = 1;
   var S = Econ.create();
@@ -41,7 +52,7 @@
     'drag a bob \u00b7 fling it harder',
     'shift-click a tick \u00b7 buy 50'
   ];
-  var TUT_TIMEOUT = [7, 14, 30, 14, 20, 16];
+  var TUT_TIMEOUT = [10, 45, 60, 20, 45, 40]; // actionable steps wait for you
   var tutStep = 0, tutTime = 0, tutDwell = 0;
 
   function tutAdvance() {
@@ -304,6 +315,7 @@
 
   canvas.addEventListener('pointerdown', function (e) {
     e.preventDefault();
+    setRun(true);
     sfx.unlock();
     pointer.x = e.clientX; pointer.y = e.clientY;
 
@@ -359,10 +371,17 @@
     drag = null;
   });
   window.addEventListener('pointercancel', function () { drag = null; });
-  window.addEventListener('blur', function () { drag = null; });
+  document.addEventListener('visibilitychange', function () { setRun(!document.hidden); });
+  window.addEventListener('blur', function () { drag = null; setRun(false); });
+  window.addEventListener('focus', function () { setRun(true); });
 
   window.addEventListener('keydown', function (e) {
+    setRun(true);
     if (e.key === 'r' || e.key === 'R') restart();
+    if (e.key === 't' || e.key === 'T') {
+      tutStep = 0; tutTime = 0; tutDwell = 0;
+      Render.float(W / 2, 84, 'tutorial', (phase * 27 + 140) % 360);
+    }
     if (e.key === 'm' || e.key === 'M') {
       var mu = sfx.toggle();
       Render.float(W / 2, 62, mu ? 'muted' : 'sound', (phase * 27 + 140) % 360);
@@ -404,6 +423,11 @@
   var lastDt = 1 / 60;
 
   function frame(now) {
+    if (!running) {
+      last = now;
+      requestAnimationFrame(frame);
+      return;
+    }
     var dt = Math.min((now - last) / 1000, 0.1);
     last = now;
     lastDt = dt;

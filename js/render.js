@@ -581,16 +581,18 @@ var Render = (function () {
       ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2); ctx.fill();
     }
 
-    ctx.font = mono(11);
-    ctx.fillStyle = 'rgba(255,255,255,0.52)';
+    ctx.font = mono(12);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.fillText(t.text, W / 2, 62);
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    ctx.fillRect(W / 2 - 90, 70, 180, 1);
 
     var dw = 11, x0 = W / 2 - (t.total - 1) * dw / 2;
     for (var i = 0; i < t.total; i++) {
-      ctx.fillStyle = i < t.step ? 'rgba(255,255,255,0.4)'
-        : i === t.step ? 'rgba(255,255,255,0.75)'
-        : 'rgba(255,255,255,0.14)';
-      ctx.fillRect(x0 + i * dw - 1.5, 74, 3, 3);
+      ctx.fillStyle = i < t.step ? 'rgba(255,255,255,0.55)'
+        : i === t.step ? 'rgba(255,255,255,0.9)'
+        : 'rgba(255,255,255,0.2)';
+      ctx.fillRect(x0 + i * dw - 1.5, 78, 3, 3);
     }
     ctx.restore();
   }

@@ -23,7 +23,10 @@ python3 -m http.server 8777     # then http://127.0.0.1:8777/
 | **click a tick** (bottom strip) | buy a level · hover = cost + gain · **shift** = buy 50 |
 | **drag a bob** | fling it (velocity carries on release) |
 | **click a focus zone** (5× per run) | one-time archetype multiplier |
-| **m / r** | mute / restart |
+| **m / r / t** | mute / restart / replay tutorial |
+
+The game **stops in the background**: hidden tab or unfocused window = no
+income, no physics, no sound. Click or press any key to resume.
 
 ## The build decision
 
